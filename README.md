@@ -1,0 +1,96 @@
+# ccsess
+
+A small, zero-dependency CLI to **rescue, search, resume, and mine Claude Code sessions**.
+
+Claude Code stores every session as `~/.claude/projects/<slug>/<id>.jsonl`, where `<slug>`
+is the working-directory path with `/` replaced by `-`. Because the storage location is
+derived purely from the path, **renaming or moving a project directory orphans its
+sessions** — `claude --resume` looks under the new slug and finds nothing, even though the
+transcript is still on disk. `ccsess` finds those orphans and relinks them, searches across
+every transcript regardless of folder, and indexes the whole corpus for insights.
+
+> Native `/cd` (Claude Code v2.1.169+) relocates a **live** session. `ccsess` handles what
+> `/cd` can't: sessions that were **already** orphaned, cross-folder search, and analysis.
+
+## Install / run
+
+Built with [uv](https://docs.astral.sh/uv/) (no pip). From the repo:
+
+```bash
+uv run ccsess --help
+```
+
+Install it on your PATH as a tool:
+
+```bash
+uv tool install --editable .
+ccsess --help
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `ccsess scan [-v]` | **One line per project**, grouped by status (orphan / backup / ok) and numbered. `-v` expands each project to its sessions. |
+| `ccsess doctor` | Health report: orphans, backups, empty folders, largest sessions. |
+| `ccsess rescue <target> [--to DIR] [--apply] [--move] [-y]` | Relink an orphaned session into a real directory. Without `--to`, suggests likely homes. |
+| `ccsess resume <target> [--apply] [-y]` | Make any session resumable from the **current** directory. |
+| `ccsess clean [-y]` | Delete stale backups + empty slug folders (the things `doctor` flags). Prompts first. |
+| `ccsess rm <target> [-y]` | Permanently delete one session transcript. Prompts first. |
+| `ccsess search "<text>" [--project X] [--since DATE]` | Full-text search across **all** transcripts, wherever they live. |
+| `ccsess index [--rebuild]` | Build/refresh the SQLite+FTS5 index (incremental). |
+| `ccsess stats` | Per-project / per-model rollups, token totals, rough cost estimate. |
+| `ccsess export <target> [--format md\|json] [--out FILE]` | Render a transcript for archiving or as a memory seed. |
+
+A **`<target>`** is a **scan number** (e.g. `2`, from the last `ccsess scan`), a **project name**
+(e.g. `enquire`), or a **session id / prefix**. When a project has several sessions, the command
+lists them so you can pick one.
+
+## Typical flows
+
+**Rescue a moved project's session:**
+```bash
+ccsess scan                       # numbered, orphans first
+ccsess rescue 2                   # by scan number (or: ccsess rescue enquire)
+ccsess rescue 2 --to ~/work/dev/newname --apply   # confirms, then relinks
+cd ~/work/dev/newname && claude --resume <id>
+```
+
+**"I know we discussed X but can't find the session":**
+```bash
+ccsess index                      # once (re-run is incremental)
+ccsess search "stripe webhook signature"
+ccsess resume <id> --apply        # then: claude --resume <id>
+```
+
+## Safety
+
+- **Dry-run by default.** `rescue`/`resume` only write with `--apply`, and then **prompt for
+  confirmation** before touching anything (`-y/--yes` skips the prompt for scripts).
+- **Copy, not move.** Originals are preserved unless you pass `--move`.
+- **Validated rewrites.** When relinking rewrites the old working-directory path to the new
+  one, every line is re-parsed as JSON before and after, and the destination is backed up
+  (`.jsonl.bak`) first.
+- **Deletion is confirmed.** `clean` and `rm` are the only commands that delete, and both
+  prompt first (and refuse entirely when run non-interactively without `-y`). `doctor` still
+  only *suggests*. `clean` removes copies that are resumable elsewhere and folders that are
+  already empty; `rm` permanently removes a single transcript.
+
+## How it works
+
+- A session's real working directory comes from the `cwd` field inside the transcript (the
+  folder slug is lossy). `slug_for(path) = path.replace('/', '-')`.
+- Orphan detection: a session is **orphaned** when its recorded `cwd` no longer exists. It's a
+  **stale backup** (not a true orphan) when another file with the same id is still resumable.
+- Auto-finding a moved project's new home: `rescue` extracts the file paths the transcript
+  referenced under the old `cwd`, then scores candidate directories by how many of those
+  paths exist under them (plus basename/branch match).
+- Only top-level `*/*.jsonl` files are treated as sessions; nested `subagents/*.jsonl` and
+  plugin logs are intentionally excluded from rescue/resume.
+
+## Notes
+
+- `stats` cost figures are a **rough list-price approximation** (cache reads/writes included)
+  for relative comparison, not a billing statement.
+- The index lives at `~/.claude/ccsess.db`. The scan number→project map (so `rescue 2` works)
+  lives at `~/.claude/ccsess-scan.json` and is rewritten on every `ccsess scan`.
