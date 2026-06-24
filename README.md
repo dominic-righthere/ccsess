@@ -88,6 +88,19 @@ ccsess resume <id> --apply        # then: claude --resume <id>
 - Only top-level `*/*.jsonl` files are treated as sessions; nested `subagents/*.jsonl` and
   plugin logs are intentionally excluded from rescue/resume.
 
+## Development
+
+The CLI itself has **zero runtime dependencies**; tests use `pytest` (a dev-only group).
+
+```bash
+uv run pytest          # run the suite
+uv build               # build sdist + wheel
+```
+
+Tests live in `tests/` and cover slug encoding, title/whitespace handling, orphan vs
+stale-backup detection, the width-responsive `scan` output, target resolution (index / name /
+id), and the relink path-rewrite — including absolute-path normalization of a relative `--to`.
+
 ## Notes
 
 - `stats` cost figures are a **rough list-price approximation** (cache reads/writes included)
