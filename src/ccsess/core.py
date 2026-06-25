@@ -10,13 +10,25 @@ the transcripts, compute the slug, and safely relink files into a new home.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+def config_dir() -> Path:
+    """Base Claude Code config directory.
+
+    Honors ``$CLAUDE_CONFIG_DIR`` (the same override Claude Code itself uses to
+    relocate session storage) and falls back to ``~/.claude``."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".claude"
+
+
+CONFIG_DIR = config_dir()
+PROJECTS_DIR = CONFIG_DIR / "projects"
 
 # Directories we never descend into while hunting for an orphan's new home.
 _PRUNE = {
@@ -149,8 +161,9 @@ def read_session(path: Path) -> Session:
     )
 
 
-def iter_sessions(projects_dir: Path = PROJECTS_DIR) -> Iterator[Session]:
+def iter_sessions(projects_dir: Optional[Path] = None) -> Iterator[Session]:
     """Yield a :class:`Session` for every transcript under ``projects_dir``."""
+    projects_dir = projects_dir or PROJECTS_DIR
     for jsonl in sorted(projects_dir.glob("*/*.jsonl")):
         try:
             yield read_session(jsonl)
@@ -158,14 +171,18 @@ def iter_sessions(projects_dir: Path = PROJECTS_DIR) -> Iterator[Session]:
             continue
 
 
-def find_session(session_id: str, projects_dir: Path = PROJECTS_DIR) -> Optional[Path]:
+def find_session(session_id: str, projects_dir: Optional[Path] = None) -> Optional[Path]:
     """Locate a transcript file by session id, wherever it lives."""
+    projects_dir = projects_dir or PROJECTS_DIR
     matches = list(projects_dir.glob(f"*/{session_id}.jsonl"))
     return matches[0] if matches else None
 
 
-def empty_slug_dirs(projects_dir: Path = PROJECTS_DIR) -> list[Path]:
+def empty_slug_dirs(projects_dir: Optional[Path] = None) -> list[Path]:
     """Project folders that contain no ``.jsonl`` transcript (stale leftovers)."""
+    projects_dir = projects_dir or PROJECTS_DIR
+    if not projects_dir.is_dir():
+        return []
     out = []
     for d in sorted(projects_dir.iterdir()):
         if d.is_dir() and not any(d.glob("*.jsonl")):
@@ -255,7 +272,6 @@ class Candidate:
     path: Path
     score: int
     hits: int
-    basename_match: bool
     branch_match: bool
 
 
@@ -272,12 +288,22 @@ def _referenced_subpaths(src: Path, old_cwd: str, limit: int = 40) -> list[str]:
     return [p for p, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:limit]]
 
 
+def _git_branch_of(path: Path) -> Optional[str]:
+    """The checked-out branch of a git repo at ``path`` (None if not a repo/branch)."""
+    try:
+        head = (path / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    prefix = "ref: refs/heads/"
+    return head[len(prefix):] if head.startswith(prefix) else None
+
+
 def _walk_dirs(roots: list[Path], target_basename: str, max_depth: int = 6) -> Iterator[Path]:
     for root in roots:
         if not root.is_dir():
             continue
         root_depth = len(root.parts)
-        for dirpath, dirnames, _ in __import__("os").walk(root):
+        for dirpath, dirnames, _ in os.walk(root):
             p = Path(dirpath)
             if len(p.parts) - root_depth >= max_depth:
                 dirnames[:] = []
@@ -310,12 +336,12 @@ def candidate_dirs(
         if cand in seen or str(cand) == old_cwd:
             continue
         seen.add(cand)
+        # Every walked dir already matches the basename, so rank by how many of the
+        # transcript's referenced subpaths exist here, with a boost for a real branch match.
         hits = sum(1 for rel in subpaths if (cand / rel).exists())
-        branch_match = bool(git_branch) and (cand / ".git").exists()
-        score = hits * 10 + 5  # +5 for basename match (all walked dirs match basename)
-        if branch_match:
-            score += 2
-        results.append(Candidate(cand, score, hits, True, branch_match))
+        branch_match = bool(git_branch) and _git_branch_of(cand) == git_branch
+        score = hits * 10 + (2 if branch_match else 0)
+        results.append(Candidate(cand, score, hits, branch_match))
 
     results.sort(key=lambda c: (-c.score, len(str(c.path))))
     return results[:limit]

@@ -33,7 +33,7 @@ ccsess --help
 |---|---|
 | `ccsess scan [-v]` | **One line per project**, grouped by status (orphan / backup / ok) and numbered. `-v` expands each project to its sessions. |
 | `ccsess doctor` | Health report: orphans, backups, empty folders, largest sessions. |
-| `ccsess rescue <target> [--to DIR] [--apply] [--move] [-y]` | Relink an orphaned session into a real directory. Without `--to`, suggests likely homes. |
+| `ccsess rescue <target> [--to DIR] [--all] [--apply] [--move] [-y]` | Relink an orphaned session into a real directory. Without `--to`, suggests likely homes; `--all` relinks **every** session of the project. |
 | `ccsess resume <target> [--apply] [-y]` | Make any session resumable from the **current** directory. |
 | `ccsess clean [-y]` | Delete stale backups + empty slug folders (the things `doctor` flags). Prompts first. |
 | `ccsess rm <target> [-y]` | Permanently delete one session transcript. Prompts first. |
@@ -105,5 +105,6 @@ id), and the relink path-rewrite — including absolute-path normalization of a 
 
 - `stats` cost figures are a **rough list-price approximation** (cache reads/writes included)
   for relative comparison, not a billing statement.
-- The index lives at `~/.claude/ccsess.db`. The scan number→project map (so `rescue 2` works)
-  lives at `~/.claude/ccsess-scan.json` and is rewritten on every `ccsess scan`.
+- Storage location respects **`$CLAUDE_CONFIG_DIR`** (the same override Claude Code uses),
+  falling back to `~/.claude`. The index (`ccsess.db`) and the scan number→project map
+  (`ccsess-scan.json`, rewritten on every `ccsess scan`, so `rescue 2` works) live there.

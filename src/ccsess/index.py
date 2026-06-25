@@ -10,9 +10,9 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from .core import PROJECTS_DIR, iter_lines, read_session
+from .core import PROJECTS_DIR, config_dir, iter_lines, read_session
 
-DB_PATH = Path.home() / ".claude" / "ccsess.db"
+DB_PATH = config_dir() / "ccsess.db"
 
 # Rough list-price approximation, USD per million tokens (input, output).
 # Used only for a clearly-labelled cost estimate in `stats`.
@@ -31,8 +31,8 @@ def _price_for(model: str) -> tuple[float, float]:
     return (0.0, 0.0)
 
 
-def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path or DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -66,15 +66,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             model TEXT,
             cost_usd REAL
         );
-        CREATE TABLE IF NOT EXISTS messages (
-            session_id TEXT,
-            seq INTEGER,
-            role TEXT,
-            ts TEXT,
-            tool TEXT,
-            text TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED,
             tokenize = 'porter unicode61'
@@ -114,17 +105,14 @@ def _index_one(conn: sqlite3.Connection, jsonl: Path) -> None:
     project = sess.project_name
     in_tok = out_tok = cache_r = cache_w = 0
     model = None
-    rows: list[tuple] = []
     fts_rows: list[tuple] = []
-    seq = 0
     for d in iter_lines(jsonl):
         t = d.get("type")
         if t not in ("user", "assistant"):
             continue
         msg = d.get("message") or {}
-        text, tool = _extract_text(msg.get("content"))
+        text, _tool = _extract_text(msg.get("content"))
         ts = d.get("timestamp")
-        rows.append((sess.id, seq, t, ts, tool, text))
         if text.strip():
             fts_rows.append((text, sess.id, t, ts or ""))
         if t == "assistant":
@@ -134,7 +122,6 @@ def _index_one(conn: sqlite3.Connection, jsonl: Path) -> None:
             cache_r += usage.get("cache_read_input_tokens", 0) or 0
             cache_w += usage.get("cache_creation_input_tokens", 0) or 0
             model = model or msg.get("model")
-        seq += 1
 
     pin, pout = _price_for(model or "")
     # cache read ~10% of input price, cache write ~25% premium (rough).
@@ -146,7 +133,6 @@ def _index_one(conn: sqlite3.Connection, jsonl: Path) -> None:
     ) / 1_000_000
 
     conn.execute("DELETE FROM sessions WHERE id = ?", (sess.id,))
-    conn.execute("DELETE FROM messages WHERE session_id = ?", (sess.id,))
     conn.execute("DELETE FROM messages_fts WHERE session_id = ?", (sess.id,))
     conn.execute(
         """INSERT INTO sessions VALUES
@@ -158,13 +144,14 @@ def _index_one(conn: sqlite3.Connection, jsonl: Path) -> None:
             cache_r, cache_w, model, round(cost, 4),
         ),
     )
-    conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)", rows)
     conn.executemany("INSERT INTO messages_fts VALUES (?,?,?,?)", fts_rows)
 
 
-def build(projects_dir: Path = PROJECTS_DIR, db_path: Path = DB_PATH,
+def build(projects_dir: Optional[Path] = None, db_path: Optional[Path] = None,
           rebuild: bool = False) -> dict:
     """Incrementally (re)build the index. Returns counts."""
+    projects_dir = projects_dir or PROJECTS_DIR
+    db_path = db_path or DB_PATH
     if rebuild and db_path.exists():
         db_path.unlink()
     conn = connect(db_path)
@@ -190,47 +177,43 @@ def build(projects_dir: Path = PROJECTS_DIR, db_path: Path = DB_PATH,
 
 
 def search(query: str, *, project: Optional[str] = None, since: Optional[str] = None,
-           limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+           limit: int = 20, db_path: Optional[Path] = None) -> list[dict]:
     """Full-text search across all indexed messages, grouped by session.
 
-    ``snippet()`` only works in a non-aggregate query against the FTS table, so we
-    fetch matches with snippets first, then dedupe by session and join metadata.
+    Filters (``project``/``since``) are applied in SQL alongside the FTS match — before
+    the safety cap — so a narrow filter can't be starved by unrelated matches.
+    ``snippet()`` runs in the same query and session metadata is joined in.
     """
     conn = connect(db_path)
-    matches = conn.execute(
-        "SELECT session_id, snippet(messages_fts, 0, '[', ']', ' … ', 12) AS snip "
-        "FROM messages_fts WHERE messages_fts MATCH ? LIMIT 2000",
-        (query,),
-    ).fetchall()
-    order: list[str] = []
-    info: dict[str, dict] = {}
-    for m in matches:
-        sid = m["session_id"]
-        if sid not in info:
-            info[sid] = {"hits": 0, "snip": m["snip"]}
-            order.append(sid)
-        info[sid]["hits"] += 1
-    if not info:
-        conn.close()
-        return []
-    qmarks = ",".join("?" * len(info))
-    meta = {r["id"]: r for r in conn.execute(
-        f"SELECT * FROM sessions WHERE id IN ({qmarks})", list(info))}
+    sql = [
+        "SELECT m.session_id AS id, "
+        "snippet(messages_fts, 0, '[', ']', ' … ', 12) AS snip, "
+        "s.title AS title, s.project AS project, s.cwd AS cwd, "
+        "s.orphaned AS orphaned, s.last_ts AS last_ts "
+        "FROM messages_fts m JOIN sessions s ON s.id = m.session_id "
+        "WHERE messages_fts MATCH ?"
+    ]
+    params: list = [query]
+    if project:
+        sql.append("AND s.project = ?")
+        params.append(project)
+    if since:
+        sql.append("AND COALESCE(s.last_ts, '') >= ?")
+        params.append(since)
+    sql.append("LIMIT 2000")
+    rows = conn.execute(" ".join(sql), params).fetchall()
     conn.close()
 
-    out: list[dict] = []
-    for sid in order:
-        s = meta.get(sid)
-        if not s:
-            continue
-        if project and s["project"] != project:
-            continue
-        if since and (s["last_ts"] or "") < since:
-            continue
-        out.append({
-            "id": sid, "title": s["title"], "project": s["project"],
-            "cwd": s["cwd"], "orphaned": s["orphaned"], "last_ts": s["last_ts"],
-            "snip": info[sid]["snip"], "hits": info[sid]["hits"],
-        })
-    out.sort(key=lambda r: r["last_ts"] or "", reverse=True)
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        g = grouped.get(r["id"])
+        if g is None:
+            grouped[r["id"]] = {
+                "id": r["id"], "title": r["title"], "project": r["project"],
+                "cwd": r["cwd"], "orphaned": r["orphaned"], "last_ts": r["last_ts"],
+                "snip": r["snip"], "hits": 1,
+            }
+        else:
+            g["hits"] += 1
+    out = sorted(grouped.values(), key=lambda r: r["last_ts"] or "", reverse=True)
     return out[:limit]

@@ -1,6 +1,7 @@
 """Tests for ccsess.core — reading, classifying, and relinking sessions."""
 
 import json
+from pathlib import Path
 
 from ccsess import core
 
@@ -90,6 +91,52 @@ def test_empty_slug_dirs(tmp_path):
     (tmp_path / "empty").mkdir()
     _write_jsonl(tmp_path / "full" / "s.jsonl", {"type": "user"})
     assert core.empty_slug_dirs(tmp_path) == [tmp_path / "empty"]
+
+
+def test_empty_slug_dirs_missing_dir_returns_empty(tmp_path):
+    # a fresh / relocated config dir may not have a projects/ folder yet
+    assert core.empty_slug_dirs(tmp_path / "does-not-exist") == []
+
+
+# --------------------------------------------------------------------------- #
+# config dir honors CLAUDE_CONFIG_DIR
+# --------------------------------------------------------------------------- #
+def test_config_dir_honors_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    assert core.config_dir() == tmp_path / "cfg"
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert core.config_dir() == Path.home() / ".claude"
+
+
+# --------------------------------------------------------------------------- #
+# git branch detection + candidate ranking
+# --------------------------------------------------------------------------- #
+def test_git_branch_of(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="utf-8")
+    assert core._git_branch_of(repo) == "feature/x"
+    assert core._git_branch_of(tmp_path / "nope") is None
+    (repo / ".git" / "HEAD").write_text("0123abc\n", encoding="utf-8")  # detached
+    assert core._git_branch_of(repo) is None
+
+
+def test_candidate_dirs_ranks_by_referenced_paths(tmp_path):
+    old = "/old/myproj"
+    src = tmp_path / "src.jsonl"
+    _write_jsonl(src, {"type": "user", "cwd": old,
+                       "message": {"content": "edit /old/myproj/src/app.py twice: /old/myproj/src/app.py"}})
+    roots = tmp_path / "roots"
+    good = roots / "a" / "myproj"
+    (good / "src").mkdir(parents=True)
+    (good / "src" / "app.py").write_text("x", encoding="utf-8")
+    bad = roots / "b" / "myproj"
+    bad.mkdir(parents=True)
+
+    cands = core.candidate_dirs(src, old, search_roots=[roots])
+    assert cands and cands[0].path == good        # the dir that actually has the file wins
+    assert cands[0].hits >= 1
+    assert {c.path: c.hits for c in cands}[bad] == 0
 
 
 # --------------------------------------------------------------------------- #

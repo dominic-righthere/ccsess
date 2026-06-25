@@ -207,8 +207,11 @@ def cmd_scan(args) -> int:
     empties = core.empty_slug_dirs()
     width = term_width()
 
+    home = str(Path.home())
+    proj = str(core.PROJECTS_DIR)
+    proj = "~" + proj[len(home):] if proj.startswith(home) else proj
     print(bold(f"\n{len(sessions)} sessions · {len(by_project)} projects · "
-               f"{human(total_size)}") + dim("  ~/.claude/projects") + "\n")
+               f"{human(total_size)}") + dim(f"  {proj}") + "\n")
 
     sections = [
         ("ORPHAN", "folder moved/renamed — claude --resume can't find them"),
@@ -279,7 +282,7 @@ def cmd_doctor(args) -> int:
     return 0
 
 
-_SCAN_CACHE = core.PROJECTS_DIR.parent / "ccsess-scan.json"
+_SCAN_CACHE = core.config_dir() / "ccsess-scan.json"
 
 
 def _save_scan(order: list) -> None:
@@ -393,12 +396,20 @@ def cmd_rescue(args) -> int:
     group = _resolve_one(args.session)
     if not group:
         return 1
-    sess = _pick_session(group, "rescue", assume_yes=args.yes)
-    if not sess:
-        return 1
+    if args.all:
+        if not args.to:
+            print(red("--all requires --to <dir> (relinks every session of the project there)."))
+            return 1
+        sessions = group["sessions"]
+    else:
+        sess = _pick_session(group, "rescue", assume_yes=args.yes)
+        if not sess:
+            return 1
+        sessions = [sess]
 
     target = args.to
     if not target:
+        sess = sessions[0]
         if not sess.orphaned:
             print(green(f"Session is not orphaned — its cwd exists: {sess.cwd}"))
             print(dim("Pass --to <dir> to relink it somewhere else anyway."))
@@ -419,13 +430,19 @@ def cmd_rescue(args) -> int:
     dest_dir = Path(target).expanduser().resolve()
     missing = not dest_dir.is_dir()
 
-    plan = core.plan_relink(sess.path, target, move=args.move, rewrite_paths=not args.no_rewrite)
-    print(bold("\nRescue plan:"))
-    print(f"  {'move' if plan.move else 'copy'}: {plan.src}")
-    print(f"            → {plan.dest}")
-    if plan.rewrite_paths:
-        print(f"  rewrite cwd: {plan.old_cwd}")
-        print(f"            → {plan.new_cwd}")
+    plans = [core.plan_relink(s.path, target, move=args.move, rewrite_paths=not args.no_rewrite)
+             for s in sessions]
+    print(bold(f"\nRescue plan ({_plural(len(plans), 'session')} → {dest_dir}):"))
+    overwrite = False
+    for plan in plans:
+        print(f"  {'move' if plan.move else 'copy'}: {plan.src}")
+        print(f"            → {plan.dest}")
+        if plan.dest.exists():
+            overwrite = True
+            print(yellow("            ⚠ destination already exists — will be overwritten"))
+    if plans[0].rewrite_paths:
+        print(f"  rewrite cwd: {plans[0].old_cwd}")
+        print(f"            → {plans[0].new_cwd}")
     if missing:
         print(yellow(f"\n⚠ target directory does not exist: {dest_dir}")
               + dim("\n  A session can only resume from a real directory — create it or fix --to."))
@@ -435,15 +452,21 @@ def cmd_rescue(args) -> int:
     if missing:
         print(red("Refusing to apply: target directory does not exist."))
         return 1
-    if not _confirm("\nApply this rescue?", assume_yes=args.yes):
+    prompt = "\nApply this rescue?" if len(plans) == 1 else f"\nApply these {len(plans)} rescues?"
+    if overwrite:
+        prompt += " (overwrites existing)"
+    if not _confirm(prompt, assume_yes=args.yes):
         print(dim("cancelled"))
         return 1
-    res = core.apply_relink(plan)
-    print(green(f"\n✓ written {res['dest']}"))
-    if res["replacements"]:
-        print(dim(f"  {res['replacements']} path replacements over {res['lines']} lines"))
-    print(bold("\nResume it:"))
-    print(f"  cd {target} && claude --resume {sess.id}")
+    for plan in plans:
+        res = core.apply_relink(plan)
+        print(green(f"✓ {res['dest']}")
+              + (dim(f"  ({res['replacements']} path replacements)") if res["replacements"] else ""))
+    print(bold("\nResume:"))
+    if len(sessions) == 1:
+        print(f"  cd {target} && claude --resume {sessions[0].id}")
+    else:
+        print(f"  cd {target} && claude --resume   " + dim("# then pick from the list"))
     return 0
 
 
@@ -666,6 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("rescue", help="relink an orphaned session into a real directory")
     s.add_argument("session", help=target_help)
     s.add_argument("--to", help="target directory to relink into")
+    s.add_argument("--all", action="store_true",
+                   help="relink every session of the project (requires --to)")
     s.add_argument("--apply", action="store_true", help="execute (default: dry-run)")
     s.add_argument("--move", action="store_true", help="move instead of copy")
     s.add_argument("--no-rewrite", action="store_true", help="don't rewrite internal paths")
