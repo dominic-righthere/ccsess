@@ -1,7 +1,5 @@
 """Tests for ccsess.cli — formatting, classification, width fitting, resolving."""
 
-import json
-
 from ccsess import cli, core
 
 
@@ -71,21 +69,25 @@ def test_session_line_fits_width_and_drops_columns_when_narrow():
 # resolving a target by scan index / name / id-prefix
 # --------------------------------------------------------------------------- #
 def test_resolve_projects_by_scan_index(tmp_path, monkeypatch):
-    jsonl = tmp_path / "slug" / "sid.jsonl"
-    jsonl.parent.mkdir(parents=True)
-    jsonl.write_text(json.dumps({"type": "user", "cwd": "/proj",
-                                 "message": {"content": "hi"}}) + "\n", encoding="utf-8")
-    cache = tmp_path / "scan.json"
-    cache.write_text(json.dumps({"projects": [
-        {"index": 1, "name": "proj", "key": "/proj", "status": "OK",
-         "sessions": [{"id": "sid", "path": str(jsonl)}]}]}), encoding="utf-8")
-    monkeypatch.setattr(cli, "_SCAN_CACHE", cache)
+    # numbers are recomputed (ORPHAN → BACKUP → OK), so #1 is the orphan, #2 the ok project
+    orphan = _session(id="orph1111", cwd="/gone/alpha")     # cwd missing → ORPHAN
+    okay = _session(id="okay2222", cwd=str(tmp_path))       # cwd exists → OK
+    monkeypatch.setattr(core, "iter_sessions", lambda *a, **k: [okay, orphan])
 
-    groups = cli._resolve_projects("1")
-    assert len(groups) == 1
-    assert [s.id for s in groups[0]["sessions"]] == ["sid"]
+    g1 = cli._resolve_projects("1")
+    assert len(g1) == 1 and g1[0]["name"] == "alpha"        # orphan numbered first
+    g2 = cli._resolve_projects("2")
+    assert len(g2) == 1 and g2[0]["sessions"][0].id == "okay2222"
+    assert cli._resolve_projects("99") == []                # unknown index → no match
 
-    assert cli._resolve_projects("99") == []   # unknown index → no match
+
+def test_ordered_projects_is_deterministic(tmp_path, monkeypatch):
+    sessions = [_session(id="a", cwd="/gone/x"), _session(id="b", cwd=str(tmp_path))]
+    monkeypatch.setattr(core, "iter_sessions", lambda *a, **k: sessions)
+    first = [(p["index"], p["status"], p["name"]) for p in cli.ordered_projects()]
+    second = [(p["index"], p["status"], p["name"]) for p in cli.ordered_projects()]
+    assert first == second                                  # stable across calls
+    assert first[0][1] == "ORPHAN"                          # broken first
 
 
 def test_resolve_projects_by_name_and_id_prefix(monkeypatch):

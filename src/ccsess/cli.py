@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import sys
@@ -166,42 +165,10 @@ def _print_project_expansion(p: dict, width: int) -> None:
 
 def cmd_scan(args) -> int:
     sessions = list(core.iter_sessions())
-    true_orphans, backups, is_backup = _classify(sessions)
+    true_orphans, backups, _ = _classify(sessions)
 
-    by_project: dict[str, list] = defaultdict(list)
-    for s in sessions:
-        by_project[s.cwd or s.slug_dir].append(s)
-
-    projects = []
-    for key, ss in by_project.items():
-        ss = sorted(ss, key=lambda s: s.last_ts or "", reverse=True)
-        key_path = Path(key)
-        if key_path.is_absolute() and key_path.exists():
-            status = "OK"  # Claude derives the slug from an absolute cwd; a relative
-        elif all(is_backup(s) for s in ss):  # one (../vane) is never resumable
-            status = "BACKUP"
-        else:
-            status = "ORPHAN"
-        projects.append({
-            "key": key,
-            "name": ss[0].project_name,
-            "sessions": ss,
-            "n": len(ss),
-            "size": sum(s.size for s in ss),
-            "last": max((s.last_ts or "" for s in ss), default=""),
-            "status": status,
-        })
-
-    def section(status):  # broken-first; recency within a section
-        return sorted([p for p in projects if p["status"] == status],
-                      key=lambda p: p["last"], reverse=True)
-
-    # Global display order: broken first. Number the projects in that order and
-    # persist the map so follow-up commands can target a project by its number.
-    order = section("ORPHAN") + section("BACKUP") + section("OK")
-    for i, p in enumerate(order, 1):
-        p["index"] = i
-    _save_scan(order)
+    # Number projects exactly as follow-up commands recompute them (no cache file).
+    order = ordered_projects(sessions)
 
     total_size = sum(s.size for s in sessions)
     empties = core.empty_slug_dirs()
@@ -210,7 +177,7 @@ def cmd_scan(args) -> int:
     home = str(Path.home())
     proj = str(core.PROJECTS_DIR)
     proj = "~" + proj[len(home):] if proj.startswith(home) else proj
-    print(bold(f"\n{len(sessions)} sessions · {len(by_project)} projects · "
+    print(bold(f"\n{len(sessions)} sessions · {len(order)} projects · "
                f"{human(total_size)}") + dim(f"  {proj}") + "\n")
 
     sections = [
@@ -282,50 +249,61 @@ def cmd_doctor(args) -> int:
     return 0
 
 
-_SCAN_CACHE = core.config_dir() / "ccsess-scan.json"
-
-
-def _save_scan(order: list) -> None:
-    """Persist the index→project map from the last scan so commands can target by number."""
-    data = {"projects": [
-        {"index": p["index"], "name": p["name"], "key": p["key"], "status": p["status"],
-         "sessions": [{"id": s.id, "path": str(s.path)} for s in p["sessions"]]}
-        for p in order]}
-    try:
-        _SCAN_CACHE.write_text(json.dumps(data), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def _load_scan():
-    try:
-        return json.loads(_SCAN_CACHE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
 def _group(key: str, sessions: list) -> dict:
     sessions = sorted(sessions, key=lambda s: s.last_ts or "", reverse=True)
     return {"name": (sessions[0].project_name if sessions else key),
             "key": key, "sessions": sessions}
 
 
+def ordered_projects(sessions: Optional[list] = None) -> list:
+    """Projects grouped and numbered exactly as ``scan`` displays them: ORPHAN → BACKUP
+    → OK, most-recent first within each. Deterministic, so a number resolves the same
+    whether or not ``scan`` was just run — no cache file required."""
+    if sessions is None:
+        sessions = list(core.iter_sessions())
+    _, _, is_backup = _classify(sessions)
+    by_project: dict[str, list] = defaultdict(list)
+    for s in sessions:
+        by_project[s.cwd or s.slug_dir].append(s)
+    projects = []
+    for key, ss in by_project.items():
+        ss = sorted(ss, key=lambda s: s.last_ts or "", reverse=True)
+        key_path = Path(key)
+        if key_path.is_absolute() and key_path.exists():
+            status = "OK"
+        elif all(is_backup(s) for s in ss):
+            status = "BACKUP"
+        else:
+            status = "ORPHAN"
+        projects.append({
+            "key": key, "name": ss[0].project_name, "sessions": ss,
+            "n": len(ss), "size": sum(s.size for s in ss),
+            "last": max((s.last_ts or "" for s in ss), default=""),
+            "status": status,
+        })
+
+    def section(status):
+        return sorted([p for p in projects if p["status"] == status],
+                      key=lambda p: p["last"], reverse=True)
+
+    order = section("ORPHAN") + section("BACKUP") + section("OK")
+    for i, p in enumerate(order, 1):
+        p["index"] = i
+    return order
+
+
 def _resolve_projects(token: str) -> list:
     """Resolve a token to project group(s): ``{name, key, sessions:[Session]}``.
 
-    A token may be a scan index (number), a project name, a slug-folder name, or a
-    session id / id-prefix. Index lookups use the map saved by the last ``ccsess scan``.
+    A token may be a scan number, a project name, a slug-folder name, or a session id /
+    id-prefix. Numbers are recomputed from the current corpus (the same ordering ``scan``
+    shows), so they work without any persisted state.
     """
     token = token.strip()
     if token.isdigit():
-        cache = _load_scan()
-        if not cache:
-            return []
-        for p in cache["projects"]:
+        for p in ordered_projects():
             if p["index"] == int(token):
-                ss = [core.read_session(Path(e["path"]))
-                      for e in p["sessions"] if Path(e["path"]).exists()]
-                return [_group(p["key"], ss)] if ss else []
+                return [_group(p["key"], p["sessions"])]
         return []
 
     by_project: dict[str, list] = defaultdict(list)
@@ -498,31 +476,15 @@ def cmd_resume(args) -> int:
     return 0
 
 
-def _do_search(args) -> list[dict]:
-    if idx.DB_PATH.exists():
-        return idx.search(args.query, project=args.project, since=args.since, limit=args.limit)
-    # fallback: streaming substring scan (no index yet)
-    print(dim("(no index yet — streaming scan; run `ccsess index` for fast search)"))
-    q = args.query.lower()
-    hits = []
-    for s in core.iter_sessions():
-        if args.project and s.project_name != args.project:
-            continue
-        found = False
-        with s.path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if q in line.lower():
-                    found = True
-                    break
-        if found:
-            hits.append({"id": s.id, "title": s.title, "project": s.project_name,
-                         "cwd": s.cwd, "orphaned": int(s.orphaned),
-                         "last_ts": s.last_ts, "snip": "", "hits": 1})
-    return hits[: args.limit]
-
-
 def cmd_search(args) -> int:
-    rows = _do_search(args)
+    conn, ephemeral = idx.query_connection(no_cache=args.no_cache)
+    try:
+        rows = idx.search_conn(conn, args.query, project=args.project,
+                               since=args.since, limit=args.limit)
+    finally:
+        conn.close()
+    if ephemeral:
+        print(dim("(no cached index — searched a temporary one; `ccsess index` to cache)"))
     if not rows:
         print(dim("no matches"))
         return 0
@@ -538,6 +500,15 @@ def cmd_search(args) -> int:
 
 
 def cmd_index(args) -> int:
+    if args.clear:
+        removed = [p for p in (idx.DB_PATH, core.config_dir() / "ccsess-scan.json")
+                   if p.exists()]
+        for p in removed:
+            p.unlink()
+            print(green(f"✓ removed {p}"))
+        if not removed:
+            print(dim("nothing to clear"))
+        return 0
     print(dim("indexing…"))
     res = idx.build(rebuild=args.rebuild)
     print(green(f"✓ indexed {res['indexed']} new/changed, skipped {res['skipped']} unchanged "
@@ -547,10 +518,9 @@ def cmd_index(args) -> int:
 
 
 def cmd_stats(args) -> int:
-    if not idx.DB_PATH.exists():
-        print(yellow("No index yet. Run: ccsess index"))
-        return 1
-    conn = idx.connect()
+    conn, ephemeral = idx.query_connection(no_cache=args.no_cache)
+    if ephemeral:
+        print(dim("(no cached index — computed from a temporary one; `ccsess index` to cache)"))
     n, msgs, size = conn.execute(
         "SELECT COUNT(*), SUM(message_count), SUM(size) FROM sessions").fetchone()
     it, ot, cr, cw, cost = conn.execute(
@@ -717,13 +687,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project")
     s.add_argument("--since", help="ISO date lower bound, e.g. 2026-01-01")
     s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--no-cache", action="store_true",
+                   help="ignore any persistent index; search a temporary in-memory one")
     s.set_defaults(func=cmd_search)
 
-    s = sub.add_parser("index", help="(re)build the SQLite+FTS5 index")
+    s = sub.add_parser("index", help="build the optional persistent search cache")
     s.add_argument("--rebuild", action="store_true", help="drop and rebuild from scratch")
+    s.add_argument("--clear", action="store_true", help="delete the cached index instead")
     s.set_defaults(func=cmd_index)
 
-    s = sub.add_parser("stats", help="usage/token/cost rollups from the index")
+    s = sub.add_parser("stats", help="usage/token/cost rollups across all sessions")
+    s.add_argument("--no-cache", action="store_true",
+                   help="ignore any persistent index; compute from a temporary one")
     s.set_defaults(func=cmd_stats)
 
     s = sub.add_parser("export", help="export a transcript as markdown or json")

@@ -74,6 +74,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+# Tool outputs are ~72% of the index and most of the bulk is a few giant dumps
+# (logs, file reads). Cap each tool result so big outputs are still findable by their
+# first ~2KB without bloating the index. Prose is never capped.
+_TOOL_RESULT_CAP = 2000
+
+
 def _extract_text(content) -> tuple[str, Optional[str]]:
     """Return (joined text, first tool name) from a message ``content`` value."""
     if isinstance(content, str):
@@ -94,9 +100,13 @@ def _extract_text(content) -> tuple[str, Optional[str]]:
         elif bt == "tool_result":
             c = block.get("content")
             if isinstance(c, str):
-                parts.append(c)
+                s = c
             elif isinstance(c, list):
-                parts.extend(b.get("text", "") for b in c if isinstance(b, dict))
+                s = "\n".join(b.get("text", "") for b in c if isinstance(b, dict))
+            else:
+                s = ""
+            if s:
+                parts.append(s[:_TOOL_RESULT_CAP])
     return "\n".join(p for p in parts if p), tool
 
 
@@ -147,14 +157,8 @@ def _index_one(conn: sqlite3.Connection, jsonl: Path) -> None:
     conn.executemany("INSERT INTO messages_fts VALUES (?,?,?,?)", fts_rows)
 
 
-def build(projects_dir: Optional[Path] = None, db_path: Optional[Path] = None,
-          rebuild: bool = False) -> dict:
-    """Incrementally (re)build the index. Returns counts."""
-    projects_dir = projects_dir or PROJECTS_DIR
-    db_path = db_path or DB_PATH
-    if rebuild and db_path.exists():
-        db_path.unlink()
-    conn = connect(db_path)
+def _index_all(conn: sqlite3.Connection, projects_dir: Path) -> tuple[int, int]:
+    """Index every transcript into ``conn``, skipping files unchanged since last time."""
     _ensure_schema(conn)
     known = {r["path"]: (r["size"], r["mtime"]) for r in conn.execute("SELECT * FROM files")}
     indexed = skipped = 0
@@ -171,20 +175,47 @@ def build(projects_dir: Optional[Path] = None, db_path: Optional[Path] = None,
         )
         indexed += 1
     conn.commit()
+    return indexed, skipped
+
+
+def build(projects_dir: Optional[Path] = None, db_path: Optional[Path] = None,
+          rebuild: bool = False) -> dict:
+    """Incrementally (re)build the persistent index. Returns counts."""
+    projects_dir = projects_dir or PROJECTS_DIR
+    db_path = db_path or DB_PATH
+    if rebuild and db_path.exists():
+        db_path.unlink()
+    conn = connect(db_path)
+    indexed, skipped = _index_all(conn, projects_dir)
     total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     conn.close()
     return {"indexed": indexed, "skipped": skipped, "total_sessions": total}
 
 
-def search(query: str, *, project: Optional[str] = None, since: Optional[str] = None,
-           limit: int = 20, db_path: Optional[Path] = None) -> list[dict]:
-    """Full-text search across all indexed messages, grouped by session.
+def query_connection(*, no_cache: bool = False, projects_dir: Optional[Path] = None,
+                     db_path: Optional[Path] = None) -> tuple[sqlite3.Connection, bool]:
+    """A connection to query for ``search``/``stats``, plus whether it's ephemeral.
+
+    Uses the persistent index when it exists (and ``no_cache`` is false); otherwise
+    builds a throwaway in-memory index and returns it — nothing is written to disk.
+    """
+    db_path = db_path or DB_PATH
+    if not no_cache and db_path.exists():
+        return connect(db_path), False
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _index_all(conn, projects_dir or PROJECTS_DIR)
+    return conn, True
+
+
+def search_conn(conn: sqlite3.Connection, query: str, *, project: Optional[str] = None,
+                since: Optional[str] = None, limit: int = 20) -> list[dict]:
+    """Full-text search across all indexed messages in ``conn``, grouped by session.
 
     Filters (``project``/``since``) are applied in SQL alongside the FTS match — before
     the safety cap — so a narrow filter can't be starved by unrelated matches.
     ``snippet()`` runs in the same query and session metadata is joined in.
     """
-    conn = connect(db_path)
     sql = [
         "SELECT m.session_id AS id, "
         "snippet(messages_fts, 0, '[', ']', ' … ', 12) AS snip, "
@@ -202,7 +233,6 @@ def search(query: str, *, project: Optional[str] = None, since: Optional[str] = 
         params.append(since)
     sql.append("LIMIT 2000")
     rows = conn.execute(" ".join(sql), params).fetchall()
-    conn.close()
 
     grouped: dict[str, dict] = {}
     for r in rows:
@@ -217,3 +247,13 @@ def search(query: str, *, project: Optional[str] = None, since: Optional[str] = 
             g["hits"] += 1
     out = sorted(grouped.values(), key=lambda r: r["last_ts"] or "", reverse=True)
     return out[:limit]
+
+
+def search(query: str, *, project: Optional[str] = None, since: Optional[str] = None,
+           limit: int = 20, db_path: Optional[Path] = None) -> list[dict]:
+    """Search the persistent index (convenience wrapper around :func:`search_conn`)."""
+    conn = connect(db_path)
+    try:
+        return search_conn(conn, query, project=project, since=since, limit=limit)
+    finally:
+        conn.close()

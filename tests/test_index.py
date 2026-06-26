@@ -52,3 +52,35 @@ def test_messages_table_dropped(tmp_path):
     assert "messages" not in tables          # dead table removed
     assert "messages_fts" in tables          # FTS is the text store
     assert "sessions" in tables
+
+
+def test_extract_text_caps_tool_output_not_prose():
+    big = "x" * 5000
+    text, _ = idx._extract_text([{"type": "tool_result", "content": big}])
+    assert len(text) <= idx._TOOL_RESULT_CAP          # giant tool output is trimmed
+    prose, _ = idx._extract_text([{"type": "text", "text": "y" * 5000}])
+    assert len(prose) == 5000                          # prose is never capped
+
+
+def test_query_connection_ephemeral_writes_nothing(tmp_path):
+    projects, _, _ = _build(tmp_path)
+    missing = tmp_path / "no-such.db"
+    conn, ephemeral = idx.query_connection(projects_dir=projects, db_path=missing)
+    try:
+        assert ephemeral is True
+        rows = idx.search_conn(conn, "stripe")
+        assert len(rows) == 1                          # full-quality search, no file
+    finally:
+        conn.close()
+    assert not missing.exists()                        # nothing persisted
+
+
+def test_query_connection_uses_persistent_cache(tmp_path):
+    projects, db, _ = _build(tmp_path)
+    conn, ephemeral = idx.query_connection(projects_dir=projects, db_path=db)
+    conn.close()
+    assert ephemeral is False                          # reuses the built index
+    # --no-cache forces ephemeral even when the cache exists
+    conn2, eph2 = idx.query_connection(no_cache=True, projects_dir=projects, db_path=db)
+    conn2.close()
+    assert eph2 is True

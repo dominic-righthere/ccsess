@@ -37,14 +37,15 @@ ccsess --help
 | `ccsess resume <target> [--apply] [-y]` | Make any session resumable from the **current** directory. |
 | `ccsess clean [-y]` | Delete stale backups + empty slug folders (the things `doctor` flags). Prompts first. |
 | `ccsess rm <target> [-y]` | Permanently delete one session transcript. Prompts first. |
-| `ccsess search "<text>" [--project X] [--since DATE]` | Full-text search across **all** transcripts, wherever they live. |
-| `ccsess index [--rebuild]` | Build/refresh the SQLite+FTS5 index (incremental). |
-| `ccsess stats` | Per-project / per-model rollups, token totals, rough cost estimate. |
+| `ccsess search "<text>" [--project X] [--since DATE] [--no-cache]` | Full-text search across **all** transcripts, wherever they live. |
+| `ccsess index [--rebuild] [--clear]` | Build the **optional** persistent search cache (incremental); `--clear` deletes it. |
+| `ccsess stats [--no-cache]` | Per-project / per-model rollups, token totals, rough cost estimate. |
 | `ccsess export <target> [--format md\|json] [--out FILE]` | Render a transcript for archiving or as a memory seed. |
 
-A **`<target>`** is a **scan number** (e.g. `2`, from the last `ccsess scan`), a **project name**
-(e.g. `enquire`), or a **session id / prefix**. When a project has several sessions, the command
-lists them so you can pick one.
+A **`<target>`** is a **scan number** (e.g. `2`), a **project name** (e.g. `enquire`), or a
+**session id / prefix**. Numbers match what `ccsess scan` shows and are recomputed on demand, so
+they work without any saved state. When a project has several sessions, the command lists them so
+you can pick one.
 
 ## Typical flows
 
@@ -103,8 +104,14 @@ id), and the relink path-rewrite — including absolute-path normalization of a 
 
 ## Notes
 
+- **ccsess writes nothing by default.** `scan`/`doctor`/`rescue`/`resume`/`export` read transcripts
+  directly. `search` and `stats` build a throwaway in-memory index per run (writes nothing); pass
+  `--no-cache` to force that even when a cache exists.
+- **The index is an opt-in cache.** Run `ccsess index` to persist `ccsess.db` for instant repeat
+  searches; `ccsess index --clear` deletes it. The index full-text-stores conversation prose and
+  tool output, **capping each tool result at ~2KB** so big logs/dumps stay findable without bloat.
+- Scan **numbers are recomputed** on demand (same ordering `scan` shows) — no cache file.
 - `stats` cost figures are a **rough list-price approximation** (cache reads/writes included)
   for relative comparison, not a billing statement.
 - Storage location respects **`$CLAUDE_CONFIG_DIR`** (the same override Claude Code uses),
-  falling back to `~/.claude`. The index (`ccsess.db`) and the scan number→project map
-  (`ccsess-scan.json`, rewritten on every `ccsess scan`, so `rescue 2` works) live there.
+  falling back to `~/.claude`, where the optional `ccsess.db` lives.
