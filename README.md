@@ -12,6 +12,64 @@ every transcript regardless of folder, and indexes the whole corpus for insights
 > Native `/cd` (Claude Code v2.1.169+) relocates a **live** session. `ccsess` handles what
 > `/cd` can't: sessions that were **already** orphaned, cross-folder search, and analysis.
 
+## Demo
+
+A quick tour against a sample `~/.claude`.
+
+`scan` gives you one line per project, orphans first — the sessions `claude --resume`
+can't find (a moved folder → **orphan**, a leftover copy → **backup**):
+
+![ccsess scan — one line per project, orphans first](assets/scan.svg)
+
+`search` runs full-text across every transcript, wherever it lives — and surfaces
+orphaned sessions too:
+
+![ccsess search — full-text search across every transcript](assets/search.svg)
+
+<details>
+<summary>Plain-text output</summary>
+
+```console
+$ ccsess scan
+
+8 sessions · 5 projects · 24.6KB  ~/.claude/projects
+
+ORPHAN 1 project · 1 session   folder moved/renamed — claude --resume can't fin…
+  1  payments-api  1 session · 3.0KB · last 2026-06-24 19:00
+
+BACKUP 1 project · 1 session   resumable elsewhere — safe to delete (ccsess cle…
+  2  dashboard-old  1 session · 3.0KB · last 2026-06-19 19:00
+
+OK     3 projects · 6 sessions · 18.6KB   directory exists — resumable normally
+  3  dashboard  2 sessions · 6.2KB · last 2026-06-26 19:00
+  4  acme-web  3 sessions · 9.3KB · last 2026-06-25 19:00
+  5  notes-cli  1 session · 3.1KB · last 2026-06-18 19:00
+
+→ target a project by number or name:  ccsess rescue 1   ·   -v expands sessions
+⚠ 1 orphaned session(s) needing rescue  → ccsess rescue <n>
+  1 stale backup(s) — ccsess clean
+
+$ ccsess search "stripe"
+(no cached index — searched a temporary one; `ccsess index` to cache)
+
+2 session(s) matching stripe
+
+a1b2c3d4  Add Stripe webhook signature verification
+    acme-web  2026-06-25 19:00
+    add [stripe] webhook signature verification to the checkout flow
+f6a1b2c3  Migrate charges to idempotency keys ✗orphan
+    payments-api  2026-06-24 19:00
+    migrate the charge endpoint to use [stripe] idempotency keys
+
+Resume one from here:  ccsess resume <id> --apply
+```
+
+</details>
+
+From here, `ccsess rescue 1` relinks the orphan and `ccsess resume <id>` makes any session
+resumable from your current directory; `-v` expands each project to its sessions. (The clips
+above are animated SVG terminal recordings.)
+
 ## Install / run
 
 Built with [uv](https://docs.astral.sh/uv/) (no pip). From the repo:
